@@ -1,15 +1,13 @@
 import PDFDocument from 'pdfkit';
 import ExcelJS from 'exceljs';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { randomUUID } from 'crypto';
-import { pipeline } from 'stream/promises';
+import fs from 'node:fs';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const exportsDir = path.join(__dirname, '../exports');
+// Use the operating system's temporary directory.
+const exportsDir = path.join(tmpdir(), 'plaza-exports');
 
 fs.mkdirSync(exportsDir, { recursive: true });
 
