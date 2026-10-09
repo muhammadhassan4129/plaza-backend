@@ -25,11 +25,11 @@ const storage = multer.diskStorage({
 
     // Do not use the client-provided filename for storage.
     cb(null, `${randomUUID()}${extension}`);
-  },
+  }, 
 });
 
 const fileFilter = (req, file, cb) => {
-  const extension = path.extname(file.originalname).toLowerCase();
+  const extension = path.extname(file.originalname).toLowerCase(); 
   const expectedMimeType = allowedTypes[extension];
 
   if (
