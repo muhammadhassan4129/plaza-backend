@@ -75,6 +75,11 @@ app.use('/api/reports', reportRoutes); // NEW ADD
 app.use('/api/exports', exportRoutes); // NEW ADD
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Local development ke liye listen karein, Vercel ke liye export hone dein
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+export default app;
