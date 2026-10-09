@@ -29,7 +29,12 @@ const __dirname = path.dirname(__filename);
 
 // Middleware
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: '*', // Ya yahan aap apne Vercel frontend ka exact URL bhi de sakte hain
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
 
 // 👉 Static Folder for Uploads (Yeh line add ki hai)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
