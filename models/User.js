@@ -19,6 +19,17 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    role: {
+      type: String,
+      enum: ['admin', 'manager'],
+      default: 'admin',
+    },
+
+    allowedPages: [
+      {
+        type: String,
+      },
+    ],
   },
   { timestamps: true }
 );
