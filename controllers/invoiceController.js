@@ -1,8 +1,17 @@
+import mongoose from 'mongoose';
+
 import Invoice from '../models/Invoice.js';
 import Agreement from '../models/Agreement.js';
 import Revenue from '../models/Revenue.js';
 
-// Keep currency calculations at 2 decimal places.
+import {
+  ensureAgreementInvoice,
+  generateCurrentMonthInvoices,
+  normalizeInvoiceMonth,
+} from '../services/invoiceAutomationService.js';
+
+// ==================== HELPERS ====================
+
 const roundMoney = (value) =>
   Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
@@ -12,14 +21,25 @@ const createError = (message, statusCode = 400) => {
   return error;
 };
 
-// Validate an amount without silently converting invalid input to zero.
-const validateAmount = (value, fieldName, allowZero = true) => {
+const validateId = (value, label = 'invoice ID') => {
+  if (
+    typeof value !== 'string' ||
+    !/^[a-fA-F0-9]{24}$/.test(value)
+  ) {
+    throw createError(`Invalid ${label}`);
+  }
+};
+
+const validateAmount = (
+  value,
+  fieldName,
+  allowZero = true
+) => {
   if (
     value === null ||
     value === undefined ||
-    typeof value === 'boolean' ||
     !['number', 'string'].includes(typeof value) ||
-    (typeof value === 'string' && value.trim() === '')
+    (typeof value === 'string' && !value.trim())
   ) {
     throw createError(`${fieldName} must be a valid number`);
   }
@@ -32,298 +52,487 @@ const validateAmount = (value, fieldName, allowZero = true) => {
 
   if (amount < 0 || (!allowZero && amount === 0)) {
     throw createError(
-      `${fieldName} must be ${allowZero ? 'zero or greater' : 'greater than zero'}`
+      `${fieldName} must be ${
+        allowZero ? 'zero or greater' : 'greater than zero'
+      }`
     );
   }
 
   if (Math.abs(amount - roundMoney(amount)) > 0.0000001) {
-    throw createError(`${fieldName} can have at most 2 decimal places`);
+    throw createError(
+      `${fieldName} can have at most 2 decimal places`
+    );
   }
 
   return roundMoney(amount);
 };
 
-// Supports both "October 2026" and "2026-10".
-const normalizeMonthYear = (value) => {
-  if (typeof value !== 'string') return null;
+const invoicePopulate = {
+  path: 'agreement',
+  populate: [
+    {
+      path: 'shops',
+      select: 'shopNumber floor',
+    },
+    {
+      path: 'tenant',
+      select: 'name phone whatsapp cnic',
+    },
+  ],
+};
 
-  const text = value.trim().toLowerCase();
+// Detect changes made after the edit form was opened.
+const invoiceEditSnapshot = (invoice) =>
+  JSON.stringify({
+    rentAmount: Number(invoice.rentAmount ?? 0),
+    electricityCharges: Number(
+      invoice.electricityCharges ?? 0
+    ),
+    waterCharges: Number(invoice.waterCharges ?? 0),
+    maintenanceFee: Number(invoice.maintenanceFee ?? 0),
+    lateFine: Number(invoice.lateFine ?? 0),
+    previousBalance: Number(invoice.previousBalance ?? 0),
+    totalAmount: Number(invoice.totalAmount ?? 0),
+    paidAmount: Number(invoice.paidAmount ?? 0),
+    status: invoice.status,
+  });
 
-  if (/^\d{4}-(0[1-9]|1[0-2])$/.test(text)) {
-    return text;
-  }
+const serializeInvoice = (invoice) => {
+  if (!invoice) return null;
 
-  const months = {
-    january: '01',
-    february: '02',
-    march: '03',
-    april: '04',
-    may: '05',
-    june: '06',
-    july: '07',
-    august: '08',
-    september: '09',
-    october: '10',
-    november: '11',
-    december: '12',
+  const data =
+    typeof invoice.toObject === 'function'
+      ? invoice.toObject()
+      : invoice;
+
+  return {
+    ...data,
+    editSnapshot: invoiceEditSnapshot(data),
   };
+};
 
-  const match = text.match(/^([a-z]+)\s+(\d{4})$/);
+const sendInvoiceError = (res, error) => {
+  const statusCode =
+    error.code === 11000
+      ? 409
+      : error.statusCode ||
+        (
+          ['ValidationError', 'CastError'].includes(error.name)
+            ? 400
+            : 500
+        );
 
-  if (!match || !months[match[1]]) {
-    return null;
+  return res.status(statusCode).json({
+    success: false,
+    message:
+      error.code === 11000
+        ? 'Invoice conflict. Refresh and check the existing invoice before trying again.'
+        : error.message || 'Invoice request failed',
+  });
+};
+
+// ==================== REVENUE SYNC ====================
+
+// Call only while holding an invoice write lock in a transaction.
+const writeInvoiceRevenue = async (invoice, session) => {
+  const existingRevenue = await Revenue.findOne({
+    invoiceId: invoice._id,
+  }).session(session);
+
+  // Creating an unpaid invoice does not create a collection record.
+  if (
+    !existingRevenue &&
+    Number(invoice.paidAmount ?? 0) === 0
+  ) {
+    return;
   }
 
-  return `${match[2]}-${months[match[1]]}`;
-};
-
-// Keep the existing text format for invoice displays and old report code.
-const getInvoiceMonthLabel = (normalizedMonth) => {
-  const monthNames = [
-    'January',
-    'February',
-    'March',
-    'April',
-    'May',
-    'June',
-    'July',
-    'August',
-    'September',
-    'October',
-    'November',
-    'December',
-  ];
-
-  const [year, month] = normalizedMonth.split('-');
-
-  return `${monthNames[Number(month) - 1]} ${year}`;
-};
-
-// Create or update the Revenue record linked to an invoice.
-const syncInvoiceRevenue = async (invoice) => {
-  const agreement = await Agreement.findById(invoice.agreement)
-    .populate('tenant')
-    .populate('shops');
+  const agreement = await Agreement.findById(
+    invoice.agreement
+  ).session(session);
 
   if (!agreement?.tenant) {
-    throw new Error('Agreement or tenant missing for revenue tracking');
+    throw createError(
+      'Agreement or tenant missing for revenue tracking',
+      409
+    );
   }
 
-  const normalizedMonth = normalizeMonthYear(invoice.monthYear);
+  const monthYear = normalizeInvoiceMonth(invoice.monthYear);
 
-  if (!normalizedMonth) {
-    throw new Error('Invoice month is invalid for revenue tracking');
+  if (!monthYear) {
+    throw createError(
+      'Invoice month is invalid for revenue tracking',
+      409
+    );
   }
 
   const revenueData = {
     invoiceId: invoice._id,
-    agreementId: invoice.agreement,
-    tenantId: agreement.tenant._id,
-    shopIds: agreement.shops.map((shop) => shop._id),
-    monthYear: normalizedMonth,
+    agreementId: agreement._id,
+    tenantId: agreement.tenant,
+    shopIds: agreement.shops,
+
+    monthYear,
+
     rentAmount: invoice.rentAmount,
     electricityCharges: invoice.electricityCharges,
     waterCharges: invoice.waterCharges,
     maintenanceFee: invoice.maintenanceFee,
     lateFine: invoice.lateFine,
+
     totalAmount: invoice.totalAmount,
     paidAmount: invoice.paidAmount,
+
     paymentDate: invoice.paymentDate,
     paymentMode: invoice.paymentMode,
   };
 
-  const existingRevenue = await Revenue.findOne({
-    invoiceId: invoice._id,
-  });
-
-  if (!existingRevenue) {
-    await Revenue.create(revenueData);
-    return;
-  }
-
-  // Prevent an older concurrent payment request from reducing
-  // the cumulative amount in the Revenue record.
-  if (
-    Number(existingRevenue.paidAmount || 0) >
-    Number(invoice.paidAmount)
-  ) {
-    return;
-  }
-
-  Object.assign(existingRevenue, revenueData);
-
-  await existingRevenue.save();
+  await Revenue.findOneAndUpdate(
+    {
+      invoiceId: invoice._id,
+    },
+    {
+      $set: revenueData,
+    },
+    {
+      upsert: true,
+      returnDocument: 'after',
+      session,
+      runValidators: true,
+      setDefaultsOnInsert: true,
+    }
+  );
 };
 
-// @desc Get all invoices
+// Read the latest invoice rather than syncing a stale payment response.
+const syncInvoiceRevenue = async (invoice) => {
+  const session = await mongoose.startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      const latestInvoice = await Invoice.findOneAndUpdate(
+        {
+          _id: invoice._id,
+        },
+        {
+          $inc: { __v: 1 },
+        },
+        {
+          returnDocument: 'after',
+          session,
+        }
+      );
+
+      // Invoice may have been deleted after the payment request.
+      if (!latestInvoice) return;
+
+      await writeInvoiceRevenue(latestInvoice, session);
+    });
+  } finally {
+    await session.endSession();
+  }
+};
+
+// ==================== GET INVOICES ====================
+
 export const getInvoices = async (req, res) => {
   try {
+    let automationWarning = '';
+
+    // Fallback for missed scheduler runs:
+    // create only missing current-month invoices.
+    try {
+      const summary = await generateCurrentMonthInvoices();
+
+      if (summary.failed > 0) {
+        console.error(
+          'Invoice automation failures:',
+          summary.errors
+        );
+
+        automationWarning =
+          `${summary.failed} agreement(s) could not be invoiced automatically.`;
+      }
+    } catch (error) {
+      console.error(
+        'Automatic invoice generation failed:',
+        error.message
+      );
+
+      automationWarning =
+        'Automatic generation could not complete. Existing invoices are shown.';
+    }
+
     const invoices = await Invoice.find()
-      .populate({
-        path: 'agreement',
-        populate: [
-          {
-            path: 'shops',
-            select: 'shopNumber floor',
-          },
-          {
-            path: 'tenant',
-            select: 'name phone whatsapp cnic',
-          },
-        ],
-      })
+      .populate(invoicePopulate)
       .sort({ createdAt: -1 });
+
+    res.set('Cache-Control', 'no-store');
 
     return res.status(200).json({
       success: true,
       count: invoices.length,
-      data: invoices,
+      data: invoices.map(serializeInvoice),
+      automationWarning,
     });
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return sendInvoiceError(res, error);
   }
 };
 
-// @desc Generate monthly invoice
+// ==================== CREATE INVOICE ====================
+
 export const createInvoice = async (req, res) => {
   try {
-    const {
-      agreementId,
-      monthYear,
-      electricityCharges,
-      waterCharges,
-      maintenanceFee,
-      lateFine,
-      dueDate,
-      previousBalance,
-    } = req.body;
+    const body = req.body || {};
 
-    const normalizedMonth = normalizeMonthYear(monthYear);
+    validateId(body.agreementId, 'agreement ID');
 
-    if (!normalizedMonth) {
+    if (!normalizeInvoiceMonth(body.monthYear)) {
       throw createError(
         'Enter a valid month, such as October 2026 or 2026-10'
       );
     }
 
-    if (!dueDate || Number.isNaN(new Date(dueDate).getTime())) {
-      throw createError('A valid due date is required');
-    }
+    const result = await ensureAgreementInvoice({
+      agreementId: body.agreementId,
+      monthYear: body.monthYear,
 
-    const agreement = await Agreement.findById(agreementId)
-      .populate('tenant')
-      .populate('shops');
+      // Explicit manual creation can recreate a previously
+      // deleted month. Automatic generation cannot.
+      manual: true,
 
-    if (!agreement) {
-      return res.status(404).json({
-        success: false,
-        message: 'Agreement not found for this invoice',
-      });
-    }
-
-    const optionalAmount = (value, label) =>
-      validateAmount(
-        value === '' || value === undefined || value === null
-          ? 0
-          : value,
-        label
-      );
-
-    const rent = validateAmount(agreement.monthlyRent, 'Monthly rent');
-
-    const elec = optionalAmount(
-      electricityCharges,
-      'Electricity charges'
-    );
-
-    const water = optionalAmount(waterCharges, 'Water charges');
-
-    const maint = optionalAmount(maintenanceFee, 'Maintenance fee');
-
-    const fine = optionalAmount(lateFine, 'Late fine');
-
-    const prevBal = optionalAmount(previousBalance, 'Previous balance');
-
-    const totalAmount = roundMoney(
-      rent + elec + water + maint + fine + prevBal
-    );
-
-    // Retains your existing invoice-number format.
-    const currentYear = new Date().getFullYear();
-
-    const lastInvoice = await Invoice.findOne({
-      invoiceNumber: new RegExp(`^INV-${currentYear}-`),
-    }).sort({ createdAt: -1 });
-
-    let nextNumber = 1;
-
-    if (lastInvoice?.invoiceNumber) {
-      const parts = lastInvoice.invoiceNumber.split('-');
-      const lastSequence = Number.parseInt(parts[parts.length - 1], 10);
-
-      if (Number.isFinite(lastSequence)) {
-        nextNumber = lastSequence + 1;
-      }
-    }
-
-    const invoiceNumber =
-      `INV-${currentYear}-${String(nextNumber).padStart(4, '0')}`;
-
-    const invoice = await Invoice.create({
-      invoiceNumber,
-      agreement: agreementId,
-      monthYear: getInvoiceMonthLabel(normalizedMonth),
-      rentAmount: rent,
-      electricityCharges: elec,
-      waterCharges: water,
-      maintenanceFee: maint,
-      lateFine: fine,
-      previousBalance: prevBal,
-      totalAmount,
-      paidAmount: 0,
-      balanceDue: totalAmount,
-      status: totalAmount === 0 ? 'Paid' : 'Unpaid',
-      paymentMode: 'None',
-      dueDate,
+      charges: {
+        electricityCharges: body.electricityCharges,
+        waterCharges: body.waterCharges,
+        maintenanceFee: body.maintenanceFee,
+        lateFine: body.lateFine,
+        previousBalance: body.previousBalance,
+      },
     });
 
-    return res.status(201).json({
+    // The service has already committed the invoice.
+    // A later population failure should not report creation as failed.
+    let responseInvoice = result.invoice;
+
+    try {
+      const populated = await Invoice.findById(
+        result.invoice._id
+      ).populate(invoicePopulate);
+
+      if (populated) {
+        responseInvoice = populated;
+      }
+    } catch (readError) {
+      console.error(
+        'Invoice saved, but response population failed:',
+        readError.message
+      );
+    }
+
+    return res.status(result.created ? 201 : 200).json({
       success: true,
-      message: 'Monthly invoice generated successfully',
-      data: invoice,
+      created: result.created,
+
+      message: result.created
+        ? 'Monthly invoice generated successfully'
+        : 'This month already has an invoice. Use Edit to change its charges.',
+
+      data: serializeInvoice(responseInvoice),
     });
   } catch (error) {
-    return res.status(error.statusCode || 400).json({
-      success: false,
-      message:
-        error.code === 11000
-          ? 'Invoice number already exists. Refresh and try again.'
-          : error.message,
-    });
+    return sendInvoiceError(res, error);
   }
 };
 
-// @desc Record an additional payment against an invoice
+// ==================== EDIT INVOICE CHARGES ====================
+
+export const updateInvoice = async (req, res) => {
+  let session;
+
+  try {
+    validateId(req.params.id);
+
+    const body = req.body || {};
+    const { expectedSnapshot } = body;
+
+    if (
+      typeof expectedSnapshot !== 'string' ||
+      !expectedSnapshot ||
+      expectedSnapshot.length > 10000
+    ) {
+      throw createError(
+        'Refresh the invoice list and reopen Edit.',
+        409
+      );
+    }
+
+    const editableFields = {
+      electricityCharges: 'Electricity charges',
+      waterCharges: 'Water charges',
+      maintenanceFee: 'Maintenance fee',
+      lateFine: 'Late fine',
+    };
+
+    const changes = {};
+
+    for (const [field, label] of Object.entries(editableFields)) {
+      if (Object.prototype.hasOwnProperty.call(body, field)) {
+        changes[field] = validateAmount(body[field], label);
+      }
+    }
+
+    if (!Object.keys(changes).length) {
+      throw createError('No editable charges were provided');
+    }
+
+    session = await mongoose.startSession();
+
+    let result;
+
+    await session.withTransaction(async () => {
+      const invoice = await Invoice.findById(
+        req.params.id
+      ).session(session);
+
+      if (!invoice) {
+        throw createError('Invoice not found', 404);
+      }
+
+      if (invoiceEditSnapshot(invoice) !== expectedSnapshot) {
+        throw createError(
+          'Invoice changed after you opened Edit. Refresh and reopen it.',
+          409
+        );
+      }
+
+      // Rent and opening balance remain the saved invoice values.
+      const amountFields = [
+        ['rentAmount', 'Monthly rent'],
+        ['electricityCharges', 'Electricity charges'],
+        ['waterCharges', 'Water charges'],
+        ['maintenanceFee', 'Maintenance fee'],
+        ['lateFine', 'Late fine'],
+        ['previousBalance', 'Previous balance'],
+      ];
+
+      const amounts = {};
+
+      for (const [field, label] of amountFields) {
+        amounts[field] = validateAmount(
+          changes[field] ?? invoice[field] ?? 0,
+          label
+        );
+      }
+
+      const totalAmount = roundMoney(
+        Object.values(amounts).reduce(
+          (sum, amount) => sum + amount,
+          0
+        )
+      );
+
+      const paidAmount = validateAmount(
+        invoice.paidAmount ?? 0,
+        'Paid amount'
+      );
+
+      if (totalAmount < paidAmount) {
+        throw createError(
+          'Invoice total cannot be less than its recorded payments.',
+          409
+        );
+      }
+
+      const balanceDue = roundMoney(
+        totalAmount - paidAmount
+      );
+
+      const status =
+        balanceDue === 0
+          ? 'Paid'
+          : paidAmount > 0
+            ? 'Partial'
+            : 'Unpaid';
+
+      const updatedInvoice = await Invoice.findOneAndUpdate(
+        {
+          _id: invoice._id,
+          totalAmount: invoice.totalAmount,
+          paidAmount: invoice.paidAmount,
+          status: invoice.status,
+        },
+        {
+          $set: {
+            ...changes,
+            totalAmount,
+            balanceDue,
+            status,
+          },
+          $inc: {
+            __v: 1,
+          },
+        },
+        {
+          returnDocument: 'after',
+          session,
+          runValidators: true,
+        }
+      );
+
+      if (!updatedInvoice) {
+        throw createError(
+          'Invoice changed. Refresh before editing again.',
+          409
+        );
+      }
+
+      // Keep an existing revenue record consistent with edited charges.
+      // The invoice edit and revenue update commit together.
+      await writeInvoiceRevenue(updatedInvoice, session);
+
+      const populated = await Invoice.findById(
+        updatedInvoice._id
+      )
+        .populate(invoicePopulate)
+        .session(session);
+
+      result = serializeInvoice(populated);
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Invoice charges updated successfully',
+      data: result,
+    });
+  } catch (error) {
+    return sendInvoiceError(res, error);
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+};
+
+// ==================== RECORD PAYMENT ====================
+
 export const updateInvoicePayment = async (req, res) => {
   try {
+    validateId(req.params.id);
+
     const {
       status,
       paymentMode,
       paymentAmount,
       paidAmount,
       expectedPaidAmount,
-    } = req.body;
+    } = req.body || {};
 
     const invoice = await Invoice.findById(req.params.id);
 
     if (!invoice) {
-      return res.status(404).json({
-        success: false,
-        message: 'Invoice not found',
-      });
+      throw createError('Invoice not found', 404);
     }
 
     const totalAmount = validateAmount(
@@ -343,8 +552,7 @@ export const updateInvoicePayment = async (req, res) => {
       );
     }
 
-    // The updated frontend will send this value to detect stale forms
-    // and retries after an already-recorded payment.
+    // The frontend should send this to detect stale forms and retries.
     if (expectedPaidAmount !== undefined) {
       const expected = validateAmount(
         expectedPaidAmount,
@@ -369,19 +577,27 @@ export const updateInvoicePayment = async (req, res) => {
 
     const selectedPaymentMode =
       paymentMode ||
-      (invoice.paymentMode !== 'None'
-        ? invoice.paymentMode
-        : 'Cash');
+      (
+        invoice.paymentMode &&
+        invoice.paymentMode !== 'None'
+          ? invoice.paymentMode
+          : 'Cash'
+      );
 
     if (
-      !['Cash', 'Bank Transfer', 'Cheque'].includes(selectedPaymentMode)
+      !['Cash', 'Bank Transfer', 'Cheque'].includes(
+        selectedPaymentMode
+      )
     ) {
       throw createError(
         'Payment mode must be Cash, Bank Transfer or Cheque'
       );
     }
 
-    if (paymentAmount !== undefined && paidAmount !== undefined) {
+    if (
+      paymentAmount !== undefined &&
+      paidAmount !== undefined
+    ) {
       throw createError(
         'Send paymentAmount or paidAmount, not both'
       );
@@ -390,25 +606,25 @@ export const updateInvoicePayment = async (req, res) => {
     let amountReceivedNow;
 
     if (paymentAmount !== undefined) {
-      // Preferred field for the updated frontend.
       amountReceivedNow = validateAmount(
         paymentAmount,
         'Payment amount',
         false
       );
     } else if (paidAmount !== undefined) {
-      // Compatibility with YOUR currently supplied frontend:
-      // its prompt sends the amount received THIS TIME as paidAmount.
+      // Compatibility: the existing frontend sends the
+      // amount received THIS TIME as paidAmount.
       amountReceivedNow = validateAmount(
         paidAmount,
         'Payment amount',
         false
       );
     } else if (status === 'Paid') {
-      // A status-only Paid request settles the remaining balance.
       amountReceivedNow = remainingBalance;
     } else {
-      throw createError('Enter the amount received for this payment');
+      throw createError(
+        'Enter the amount received for this payment'
+      );
     }
 
     if (amountReceivedNow > remainingBalance) {
@@ -425,10 +641,10 @@ export const updateInvoicePayment = async (req, res) => {
       totalAmount - updatedPaidAmount
     );
 
-    const updatedStatus = updatedBalance === 0 ? 'Paid' : 'Partial';
+    const updatedStatus =
+      updatedBalance === 0 ? 'Paid' : 'Partial';
 
-    // Apply the payment only if the invoice has not changed
-    // since it was read. This prevents concurrent lost updates.
+    // Apply payment only if the financial values have not changed.
     const updatedInvoice = await Invoice.findOneAndUpdate(
       {
         _id: invoice._id,
@@ -444,16 +660,19 @@ export const updateInvoicePayment = async (req, res) => {
           paymentMode: selectedPaymentMode,
           paymentDate: new Date(),
         },
+        $inc: {
+          __v: 1,
+        },
       },
       {
-        new: true,
+        returnDocument: 'after',
         runValidators: true,
       }
     );
 
     if (!updatedInvoice) {
       throw createError(
-        'Another payment updated this invoice. Refresh and check its balance before trying again.',
+        'This invoice changed. Refresh and check its balance before trying again.',
         409
       );
     }
@@ -471,16 +690,19 @@ export const updateInvoicePayment = async (req, res) => {
       );
     }
 
-    // Invoice payment is already saved. Do not report it as failed
-    // merely because the separate Revenue update failed.
+    // Payment has already been saved. A separate revenue sync
+    // failure must not encourage the user to submit it again.
     return res.status(200).json({
       success: true,
+
       message: revenueSyncPending
         ? 'Payment saved, but revenue tracking needs review. Do not submit this payment again.'
         : updatedStatus === 'Paid'
           ? 'Payment recorded. Invoice is now fully paid.'
           : 'Partial payment recorded successfully.',
-      data: updatedInvoice,
+
+      data: serializeInvoice(updatedInvoice),
+
       paymentSummary: {
         previousPaidAmount,
         amountReceivedNow,
@@ -488,42 +710,103 @@ export const updateInvoicePayment = async (req, res) => {
         remainingBalance: updatedBalance,
         status: updatedStatus,
       },
+
       revenueSyncPending,
     });
   } catch (error) {
-    return res.status(error.statusCode || 400).json({
-      success: false,
-      message: error.message,
-    });
+    return sendInvoiceError(res, error);
   }
 };
 
-// @desc Delete invoice and its related revenue
+// ==================== DELETE INVOICE ====================
+
 export const deleteInvoice = async (req, res) => {
+  let session;
+
   try {
-    const invoice = await Invoice.findById(req.params.id);
+    validateId(req.params.id);
 
-    if (!invoice) {
-      return res.status(404).json({
-        success: false,
-        message: 'Invoice not found',
-      });
-    }
+    session = await mongoose.startSession();
 
-    await Revenue.deleteMany({
-      invoiceId: invoice._id,
+    await session.withTransaction(async () => {
+      // Lock the invoice against concurrent edit/payment operations.
+      const invoice = await Invoice.findOneAndUpdate(
+        {
+          _id: req.params.id,
+        },
+        {
+          $inc: { __v: 1 },
+        },
+        {
+          returnDocument: 'after',
+          session,
+        }
+      );
+
+      if (!invoice) {
+        throw createError('Invoice not found', 404);
+      }
+
+      const monthKey = normalizeInvoiceMonth(
+        invoice.monthYear
+      );
+
+      if (!monthKey) {
+        throw createError(
+          'Invoice month is invalid. Correct it before deletion.',
+          409
+        );
+      }
+
+      // Suppress this month's automatic regeneration.
+      // Future months remain eligible.
+      await Agreement.updateOne(
+        {
+          _id: invoice.agreement,
+        },
+        {
+          $addToSet: {
+            skippedInvoiceMonths: monthKey,
+          },
+          $inc: {
+            billingRevision: 1,
+          },
+        },
+        {
+          session,
+        }
+      );
+
+      // Retains the existing endpoint's deletion behaviour.
+      await Revenue.deleteMany(
+        {
+          invoiceId: invoice._id,
+        },
+        {
+          session,
+        }
+      );
+
+      await Invoice.deleteOne(
+        {
+          _id: invoice._id,
+        },
+        {
+          session,
+        }
+      );
     });
-
-    await invoice.deleteOne();
 
     return res.status(200).json({
       success: true,
-      message: 'Invoice deleted successfully',
+      message:
+        'Invoice deleted. It will not be automatically recreated for this month.',
     });
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return sendInvoiceError(res, error);
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
   }
 };
