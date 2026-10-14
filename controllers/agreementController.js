@@ -218,12 +218,35 @@ export const getAgreements = async (req, res) => {
       .populate('tenant')
       .sort({ createdAt: -1 });
 
+    const agreementIds = agreements.map((item) => item._id);
+
+    const invoicedAgreementIds = await Invoice.distinct(
+      'agreement',
+      {
+        agreement: { $in: agreementIds },
+      }
+    );
+
+    const invoicedIds = new Set(
+      invoicedAgreementIds.map(String)
+    );
+
     res.set('Cache-Control', 'no-store');
 
     return res.status(200).json({
       success: true,
       count: agreements.length,
-      data: agreements.map(serializeAgreement),
+      data: agreements.map((agreement) => {
+        const hasInvoices = invoicedIds.has(
+          String(agreement._id)
+        );
+
+        return {
+          ...serializeAgreement(agreement),
+          hasInvoices,
+          canDelete: !hasInvoices,
+        };
+      }),
     });
   } catch (error) {
     return handleError(res, error);
@@ -873,7 +896,6 @@ export const updateAgreement = async (req, res) => {
 
 // ==================== TERMINATE AGREEMENT ====================
 
-
 export const deleteAgreement = async (req, res) => {
   let session;
 
@@ -881,9 +903,6 @@ export const deleteAgreement = async (req, res) => {
     validateId(req.params.id, 'agreement ID');
 
     session = await mongoose.startSession();
-
-    let result;
-    let alreadyTerminated = false;
 
     await session.withTransaction(async () => {
       const agreement = await Agreement.findById(
@@ -894,45 +913,28 @@ export const deleteAgreement = async (req, res) => {
         throw createError('Agreement not found', 404);
       }
 
-      if (agreement.status === 'Terminated') {
-        alreadyTerminated = true;
-        result = serializeAgreement(agreement);
-        return;
-      }
+      // Always check again on the backend.
+      // The list shown in the browser may be outdated.
+      const hasInvoice = await Invoice.exists({
+        agreement: agreement._id,
+      }).session(session);
 
-      alreadyTerminated = false;
-
-      const updatedAgreement =
-        await Agreement.findOneAndUpdate(
-          {
-            _id: agreement._id,
-            status: agreement.status,
-          },
-          {
-            $set: {
-              status: 'Terminated',
-              terminatedAt: new Date(),
-            },
-          },
-          {
-            new: true,
-            session,
-            runValidators: true,
-          }
-        );
-
-      if (!updatedAgreement) {
+      if (hasInvoice) {
         throw createError(
-          'Agreement changed. Refresh and try again.',
+          'This agreement has invoices and cannot be deleted.',
           409
         );
       }
 
       const shopIds = agreement.shops || [];
 
+      await Agreement.deleteOne(
+        { _id: agreement._id },
+        { session }
+      );
+
       if (shopIds.length) {
         const otherActiveAgreements = await Agreement.find({
-          _id: { $ne: agreement._id },
           shops: { $in: shopIds },
           status: 'Active',
         })
@@ -942,12 +944,12 @@ export const deleteAgreement = async (req, res) => {
 
         const stillOccupied = new Set(
           otherActiveAgreements.flatMap((item) =>
-            (item.shops || []).map(idOf)
+            (item.shops || []).map(String)
           )
         );
 
         const releasableShopIds = shopIds.filter(
-          (id) => !stillOccupied.has(idOf(id))
+          (id) => !stillOccupied.has(String(id))
         );
 
         if (releasableShopIds.length) {
@@ -966,16 +968,12 @@ export const deleteAgreement = async (req, res) => {
           );
         }
       }
-
-      result = serializeAgreement(updatedAgreement);
     });
 
     return res.status(200).json({
       success: true,
-      message: alreadyTerminated
-        ? 'Agreement is already terminated'
-        : 'Agreement terminated. Eligible shops released and invoice history preserved.',
-      data: result,
+      message:
+        'Agreement deleted successfully. Eligible shops are now available.',
     });
   } catch (error) {
     return handleError(res, error);
