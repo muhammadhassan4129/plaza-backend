@@ -8,26 +8,41 @@ const shopSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+
     floor: {
       type: String,
       required: [true, 'Floor name is required'],
-      enum: ['Basement', 'Ground Floor', '1st Floor', '2nd Floor', 'Rooftop'],
+      enum: [
+        'Basement',
+        'Ground Floor',
+        '1st Floor',
+        '2nd Floor',
+        'Rooftop',
+      ],
       default: 'Ground Floor',
     },
+
     utilityZone: {
       type: String,
       default: 'Standard Corridor Line',
       trim: true,
     },
+
     sizeSqFt: {
       type: Number,
-      required: [true, 'Shop size in square feet is required'],
+      required: [true, 'Shop size is required'],
+      validate: {
+        validator: (value) => Number.isFinite(value) && value > 0,
+        message: 'Shop size must be greater than zero',
+      },
     },
+
     type: {
       type: String,
       enum: ['Retail Shop', 'Corporate Office', 'Storage Godown'],
       default: 'Retail Shop',
     },
+
     status: {
       type: String,
       enum: ['Available', 'Occupied', 'Maintenance'],
@@ -38,4 +53,5 @@ const shopSchema = new mongoose.Schema(
 );
 
 const Shop = mongoose.model('Shop', shopSchema);
+
 export default Shop;
