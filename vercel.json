@@ -12,6 +12,9 @@
       "dest": "server.js"
     }
   ],
+  "engines": {
+    "node": "18.x"
+  },
   "crons": [
     {
       "path": "/api/cron/invoices",
