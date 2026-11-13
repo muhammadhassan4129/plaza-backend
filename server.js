@@ -40,7 +40,7 @@ databaseReady.catch((error) => {
 
 app.use(express.json());
 
-// CORS must be registered early so preflight OPTIONS requests are handled properly
+// Enable full CORS and handle all preflight OPTIONS requests automatically
 app.use(
   cors({
     origin: '*',
@@ -48,6 +48,7 @@ app.use(
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
+app.options('*', cors());
 
 app.use(
   '/uploads',
@@ -58,11 +59,8 @@ app.get('/', (req, res) => {
   res.send('Plaza Management API is running...');
 });
 
-// API requests wait for the initial DB connection, bypassing OPTIONS preflight requests
+// API routes waiting for DB initialization
 app.use('/api', async (req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
   try {
     await databaseReady;
     next();
@@ -147,7 +145,7 @@ if (!isServerless) {
         console.log(`Server running on port ${PORT}`);
       });
 
-      if (process.env.ENABLE_ENABLE_INTERNAL_CRON !== 'false') {
+      if (process.env.ENABLE_INTERNAL_CRON !== 'false') {
         // Check shortly after midnight, Pakistan time.
         cron.schedule('5 0 * * *', runInvoiceJob, {
           timezone: 'Asia/Karachi',
