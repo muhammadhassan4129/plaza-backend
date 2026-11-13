@@ -40,7 +40,7 @@ databaseReady.catch((error) => {
 
 app.use(express.json());
 
-// Enable full CORS and handle all preflight OPTIONS requests automatically
+// Enable full CORS (automatically handles preflight OPTIONS requests)
 app.use(
   cors({
     origin: '*',
@@ -48,7 +48,6 @@ app.use(
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
-app.options('*', cors());
 
 app.use(
   '/uploads',
@@ -156,6 +155,8 @@ if (!isServerless) {
           timezone: 'Asia/Karachi',
           noOverlap: true,
         });
+
+        // Catch missing current-month invoices after restart.
         void runInvoiceJob();
       }
     })
