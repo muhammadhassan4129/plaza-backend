@@ -156,8 +156,6 @@ if (!isServerless) {
           timezone: 'Asia/Karachi',
           noOverlap: true,
         });
-
-        // Catch missing current-month invoices after restart.
         void runInvoiceJob();
       }
     })
